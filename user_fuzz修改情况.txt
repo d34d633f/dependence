@@ -1,0 +1,1379 @@
+8.19（1）首先解决mkdir目录//的问题。然后发现很多symbolic link指的是绝对目录，因此会失败。通过unlink然后symlink绝对目录+当前image的目录即可。（2）然后分析syscall。发现存在open文件会hang住，然后另一个进程open文件，因此一个一个分析系统调用思路不可行了。这和之前Firm-AFL不一样，FirmAFL只分析当前进程。因此定义syscall_context，回到用户态后判断是回到哪一个进程线程的syscall。（3）user mode的syscall每一个都是单独分析，都会再调用相应的c库函数（4）open会出现乱码，究其原因是decaf失败，而之前的procname没有清空，procname还是要系统调用完读。
+
+8.21（1）仍然存在读不出filename的情况。（2）跑fuzz的时候，需要recoverlink，将之前的testlink的symbolic链接改回来。（3）409 open configure file失败的问题。发现open的操作要用用户模式的。尝试把用户模式编译进来。是否编译linux-user下的，主要看makefile.obj。然而用户模式和系统模式的宏定义存在冲突无法同时使用两种模式。因此按照用户模式的open，把相关内容copy过来。主要是flags的转化。
+
+8.24 (1)O_CREAT都是以0开头的即为八进制，make sense，成功open 409的lighttpd.conf；（2）存在打不开的文件，如tmp/workder之类的，先绕过。（3）遇到select、poll之外的epoll，处理epoll_ctl,epoll_wait未果，会出错。
+
+9.1 （1）用FirmAFL测试，epoll_event中的events虽然是4字节，但为了对齐，data存储位置8字节后，调整后成功调用accept。（2）发现没有生成outputs/.cur_input,分析后发现是没有指定start point,将afl中的qemu_mode中的patch全部添加上即可，包括不使用模式用mem_fd等。（3）start point设置为recv处，发现会出错。设置为socket就不会错。分析了很久未果，排除程序fork导致的问题。路上觉得可能是snippet1的原因。
+
+9.8（1）409 lighttpd只要0x408000不tb_gen_code,snippet1就不会出错。（2）fuzz速度只有20/s感觉有点慢，看看系统仿真的速度。FirmAFL开启full模式，然后加上PGD结构体存放target_pgd，然后加上FirmAFL_new syscall_context,后来发现单进程不需要，就保持不变。速度5/s左右。（3）考虑如何统计syscall trace的相似性。
+
+9.10（1）输出syscall trace。
+
+9.13 （1）编写prepare_files.py
+
+9.14 （1）firmadyne kernel有变动，要用之前改动过得procinfo.ini。（2）10098 var/run要通过，不然httpd.conf不能使用。
+
+9.15 (1)10098 open httpd.conf后没有write，分析发现pgd变化了，且不是父子关系。分析一下午未果，一度怀疑是getPGD有问题
+
+9.16(1)fork产生新的task_struct,而execve会改变PGD，因此同一进程下PGD会不一样，而且不是父子关系。因此proc_fork_connector也调用VMI_creat_Process,并在vmi.cpp中VMI_create_process，发现pid已存在情况下，即execve时，记录老的cr3,并与新的cr3一起调用child_operation，这样同一进程下的execve前后PGD发生了关系。（2）如果先remove old，execve前的老进程被删，child_end_operation被调用，无法后续用child_operation关联。所以在vmi.cpp中VMI_create_process先清空process_map,保留老的process进行关联，然后再删除old。（3）由于sh最后调用httpd进程一直都在，没有销毁因此没有关闭real_fd，因此在cpu-exec.c退出位置close_all_files。（4）ori_flag不行，因为父进程结束子进程没有关闭不能close real_fd,因此find_real_fd遍历看是否还存在real_fd,不存在则close。
+
+9.17 （1）10098 fuzz 发现afl_setup不成功，发现是程序将FORKSRV_FD close掉了。因此198等不close。（2）10098 同样000结尾afl_wait_tsl不能tb_gen_code;(3) 3934 fuzz很快exit，应该是参数的问题，分析了后就发现是参数中间有空格，导致解析错误。parse_args_envs中对非-的参数加上引号。(4) 3934, chdir www失败，系统模式下www->tmp/www没有生成，先手动添加。（5）3934 chdir tmp_syscall没有输出，在新目录里输出。（6）3934 accept 第二次返回0 -EAGAIN。 （7）3934 暂时114,194 不执行，可以run。分析后发现父进程退出没关系。
+
+9.18 (11349 11973) (3250 2298 2299 4324)系列close，9326系列直接down,没有args_file，翻看日记原来之前4.11就分析过USER_FUZZ。2253 2904 socket之后直接recv (1)分析2904,发现是应该与其他服务程序的udp通信，要接受admin等值。（2）系统模式下观察2904发现不是从最初开始输出，分析了一下午才发现procinfo.ini proc_exec_connector用的是search_binary_handler。之前的10098没有用，还好。2904最终是dev/mnt/7不存在，uhttpd都存在这个问题。（3）4594要在feed_input之后，加上state = 2，才能正常工作。（5）9451, prepare_files 系a统模式就卡住了，应该是不断生成很多东西。
+
+9.21 (1)9451, delete_asso_file只是删除某一个进程文件的所有fd，只是delete_asso_file_once， child_operation要多次delete_asso_file_once。（2）9451 clone失败，分析之前发现sysctl有错误，只有一个参数，name是数组，name[0]=1为CTL_KERN, name[1] = 4输出为compile time，这些在sysctl.h中有定义，后来发现clone失败与其无关。分析clone，返回22，ENINVAL（error-base.h中定义）,原因是参数错误，看了一下flag的值，在sched.h中定义，没有错误。未果
+
+9.22（1）9451 clone参数错误继续分析，第一个、第三个参数都是flag，看了下syscall.c后续有四种形式，都不行。
+
+9.23 跳过9451 （1）11614 参数太多，修改afl-fuzz.c change_argv的100到500.(2)11143 args_file缺失，用之前的，发现卡在setuid，fffe，发现getpwnam name是nobody，而实际上是root，发现args_file原本参数不对，使用：隔开的，所以没解析出来。（3）11143中，fork之后return的文件fd都是0，但又正常运作。（4）11143 增加poll逻辑，要对非network_fd的revent设置为0
+
+9.24 输出syscall_trace_full,写2.py用于配置full模式。
+
+（1）clone的系统调用问题？
+9451:sbin/jjhttpd:normal:"DIR-820L" etc/jhttpd.conf;proc/net/arp,proc/wlan0-va0/sta_info_dlink not ok; 120 clone not ok 
+before syscall:120, args:40f00,431268,40f00,765db400, pid:4997
+after syscall:120, return: -22 ,time:0.000010, pid:4997
+error-base.h #define	EINVAL		22	/* Invalid argument */
+
+    case TARGET_NR_clone:
+        /* Linux manages to have three different orderings for its
+         * arguments to clone(); the BACKWARDS and BACKWARDS2 defines
+         * match the kernel's CONFIG_CLONE_* settings.
+         * Microblaze is further special in that it uses a sixth
+         * implicit argument to clone for the TLS pointer.
+         */
+#if defined(TARGET_MICROBLAZE)
+        ret = get_errno(do_fork(cpu_env, arg1, arg2, arg4, arg6, arg5));
+#elif defined(TARGET_CLONE_BACKWARDS)
+        ret = get_errno(do_fork(cpu_env, arg1, arg2, arg3, arg4, arg5));
+#elif defined(TARGET_CLONE_BACKWARDS2)
+        ret = get_errno(do_fork(cpu_env, arg2, arg1, arg3, arg5, arg4));
+#else
+        ret = get_errno(do_fork(cpu_env, arg1, arg2, arg3, arg5, arg4));
+#endif
+        break;
+文件的处理方法
+
+（2）snippet1 
+
+
+409 lighttpd只要0x408000不tb_gen_code,snippet1
+409:usr/sbin/lighttpd:opening configfile  /etc/lighttpd.conf failed:"EA6500"; epoll 16/s
+10098 同样000结尾afl_wait_tsl不能tb_gen_code;
+
+(3)experiment/afl/afl-fuzz.c init_forkserver execve 之前
+char** change_argv(char **argv) //zyw
+{
+  //char** new_argv = ck_alloc(sizeof(char*) * (argc + 4));
+  char** new_argv = ck_alloc(sizeof(char*) * 500);
+  new_argv[0] = argv[0];
+  int old_index = 3, new_index = 1;
+  for(;old_index< 500;)
+  {
+    if(strcmp(argv[old_index], "-E") == 0)
+    {
+      new_argv[new_index++] = argv[old_index++];
+      new_argv[new_index++] = argv[old_index++];
+    }
+    else
+    {
+      break;
+    }
+  }
+  new_argv[new_index++] = argv[1];
+  new_argv[new_index++] = argv[2];
+  for(;old_index< 500; )
+  {
+    if(argv[old_index] == NULL)
+    {
+      break;
+    }
+    new_argv[new_index++] = argv[old_index++];
+    new_argv[new_index++] = argv[old_index++];
+  }
+  for(int i = 0; i < 500; i++)
+  {
+    if(new_argv[i] == NULL)
+    {
+      break;
+    }
+    printf("arg is:%s\n", new_argv[i]);
+  }
+  return new_argv;
+
+（4）recoverlink
+import os
+
+curr_dir = os.getcwd()
+
+def recover_all_symlinks(root_dir):
+	dirs_or_files = os.listdir(root_dir)
+	for dir_file in dirs_or_files:
+		dir_file_path = os.path.join(root_dir,dir_file)
+		if os.path.islink(dir_file_path):
+			src_file = os.readlink(dir_file_path)
+			if curr_dir in src_file:
+				os.unlink(dir_file_path)
+				new_src_file = src_file[len(curr_dir):]
+				os.symlink(new_src_file, dir_file_path)
+				print "now", dir_file_path, os.readlink(dir_file_path)
+		else:
+			if os.path.isdir(dir_file_path):
+				recover_all_symlinks(dir_file_path)
+
+recover_all_symlinks(".")
+
+（5）open 转换
+
+
+
+unsigned int target_to_host_bitmask(unsigned int target_mask,
+                                    const bitmask_transtbl * trans_tbl)
+{
+    const bitmask_transtbl *btp;
+    unsigned int host_mask = 0;
+
+    for (btp = trans_tbl; btp->target_mask && btp->host_mask; btp++) {
+        if ((target_mask & btp->target_mask) == btp->target_bits) {
+            host_mask |= btp->host_bits;
+        }
+    }
+    return host_mask;
+}
+
+
+void open_operation(CPUState *cpu, int pgd, int file_fd, char *filename, target_ulong flags, target_ulong mode)
+{
+    if(print_debug) printf("-----------------------------%x open operation:%d, %s\n", pgd, file_fd, filename);
+    char tmp_fd_map[32];
+    memset(tmp_fd_map,0, 32);
+    add_fdmap(tmp_fd_map, file_fd);
+   // int real_fd = open(filename, O_RDWR | O_CREAT, 00700);
+    //openat( AT_FDCWD, filename, target_to_host_bitmask(flags, 0),mode);
+    int real_fd = open(filename, target_to_host_bitmask(flags, fcntl_flags_tbl), mode);
+    if(real_fd==-1 ) printf("@@@@@@@@@@@@@open %s flags: %o:%o, mode:%o, open_result:%d,%o, \n", filename,flags,target_to_host_bitmask(flags, fcntl_flags_tbl), mode, real_fd, file_fd);
+    if(real_fd!=-1)
+    {
+        insert_asso_file(pgd, tmp_fd_map, filename, real_fd, true);  
+    }
+}  
+
+（6） 10098 close的问题
+        //FORKSRV_FD 198 defined in config.h,  cannot close in 10098.
+        if(a0 == 198 || a0 == 197 || a0 == 199)
+        {
+            *local_or_not = 1;
+            return 0;
+        }
+        else if(a0 == network_socket || a0 == ori_network_socket) // close original socket in 3934
+        {
+            *local_or_not = 1;
+            return 0;
+        }
+        
+    }
+
+
+（7）2904,发现是应该与其他服务程序的udp通信，要接受admin
+before syscall:142, args:22,76fff280,0,0, pid:4856
+after syscall:142, return: 1 ,time:0.000008, pid:4856
+before syscall:176, args:21,767a7400,ffff,0, pid:4856
+recvfrom:English
+
+int handle_recvfrom(target_ulong a1)
+{
+    strcpy(g2h(a1), "English");
+    return 8;
+    recvfrom_2904_times++;
+    if(recvfrom_2904_times == 1)
+    {
+        strcpy(g2h(a1), "admin");
+        return 6;
+    }
+    else if(recvfrom_2904_times == 2)
+    {
+        strcpy(g2h(a1), "password");
+        return 9;
+    }
+    else if(recvfrom_2904_times == 3)
+    {
+        strcpy(g2h(a1), "GMT-0");
+        return 6;
+    }
+    else if(recvfrom_2904_times == 4)
+    {
+        strcpy(g2h(a1), "0");
+        return 2;
+    }
+    else if(recvfrom_2904_times == 5)
+    {
+        strcpy(g2h(a1), "1");
+        return 2;
+    }
+    else if(recvfrom_2904_times == 6)
+    {
+        strcpy(g2h(a1), "0");
+        return 2; 
+    }
+    else if(recvfrom_2904_times == 7)
+    {
+        strcpy(g2h(a1), "8080");
+        return 5;
+    }
+    else if(recvfrom_2904_times == 8)
+    {
+        strcpy(g2h(a1), "80");
+        return 3;
+    }
+
+}
+
+
+
+20201021
+
+syscall_trace弄到根目录
+（1）生成第9类，11349的args_file
+（2）对 firmadyne old 进行分析，第三类，第7类。
+（3）11类 13761分析
+（4）13类待分析，14类也是uhttpd，有clone的问题
+（5）9316 connect
+（6）10202 open
+
+
+20201022
+分析firmadyne old, 第三类 13788 open 不一致, 没有tmp/testmode文件, 第7类10282 没有args_file
+
+20201027
+对firmadyne old 10282与11349进行 env_analysis的获取,需要修改(1)procinfo.ini改成search_binary_handle,(2)OFFSET_PROFILE.proc_fork_connector != pc需要关闭,不然出错 
+（3）10282，发现执行错误，1）首先发现/flash等文件不存在，验证了一open_operation逻辑确实没生成。2）分析输出说是nobody这个用户不存在，然后写操作确实有write nobody这个用户到/etc/passwd。3）open失败，修改mode和flag发现是mode O_CREAT|O_EXCL，而passwd本身已存在导致报错。
+
+20201029
+
+CVE-2020-(3274, 2375, 3276, 3277, 3278, 3279, 3286, 3287, 3288, 3289, 3290, 3291)
+CVE-2020-(3292, 3293, 3294, 3295, 3296, 3268, 3269, 10213, 10215, 10216, 14074)
+CVE-2020-(14075, 14076, 14077, 14078, 14079, 14080, 14081, 12013, 10215, 10214, 10216)
+
+command injection
+cisco
+CVE-2020-(3274, 2375, 3276, 3278, 3279)  没有 3277
+CVE-2020-(3268, 3269) 
+D-link
+CVE-2020-(10213, 10215, 10216) 
+Trendnet
+CVE-2020-(14075, 14081) 
+
+stack overflow
+cisco
+ Cisco Small Business RV320 and RV325 Series Routers and Cisco Small Business RV016, RV042, and RV082 Router
+CVE-2020-(3286, 3287, 3288, 3289, 3290, 3291, 3293, 3294, 3295, 3296) 
+D-link D-Link DIR-825 Rev.B 2.10 ntp_sync.cgi 
+CVE-2020-(10214)
+Trendnet TEW-827DRU devices through 2.06B04 www/cgi/ssi
+CVE-2020-(14074, 14076, 14077, 14078, 14079, 14080)  
+
+https://github.com/kuc001/IoTFirmware/
+
+
+20201030
+继续分析10282 open /etc/passwd失败的原因。（1）发现flag是301（O_CREATE|OTRUCK)还是501(O_CREATE|O_EXCL)是根据前面的stat结果决定。如果存在就301，不存在就501，根据分析/etc/passwd不存在（2）分析不存在原因是rcS最开始调用了mount系统调用，导致etc被清空，实现mount逻辑，发现挂载不好删除，因此用删除目录然后新建目录的方式亲清空。
+
+20201102
+10282 snippet1注释掉才能正常运行,不然第几轮会crash
+对experiment/firmadyne/firmware下的固件进行分析,
+(1)D-LINK两个固件(包括老版本)httpd在登录之后(admin密码为空)均能触发overflow
+(2)编写trendnet_overflow.py, Trendnet tew-827 2.04b03 www/cgi/ssi存在漏洞,2.07b02本身有问题,无论字串多长都会crash,tew-828是arm架构,且不存在ssi.
+(3)下载qemu-2.10.1,用原始的qemu测试ssi是否缺少东西.
+(4)105607 tew-827, 环境变量中逗号不能出现,转义了也不能用.
+
+20201103
+使用interfuzz_new生成原始keywords,如409_ori(污点分析409失败,因此先使用原始keywords).开始测试409, 4528, 9136, 10098
+
+20201105
+9136挖到漏洞,应该和8915一样.
+分析3934为什么没有www目录, mount了ramfs,但好像不影响
+
+20201106
+(1)继续分析3934 www目录不存在问题.在rcS里面添加mkdir /tmp/www的命令,并根据运行结果,判断何时产生的/tmp/www.最终定位到/usr/sbin/rc中.IDA打开该二进制,发现存在字符串 ln -sf /www.eng /tmp/www,原来tmp/www是以符号链接形式存在,而非mkdir
+(2)增加symlink与link的逻辑.修改handle_filename逻辑,之前是直接去掉前面的/,但之前如果chdir进入了新目录则存在问题.因此改成前面加上cwd(getcwd获得).之前filename是100长度,改成200,ASSO_FILE中的filename字串长度也改成200.
+最终3934 www目录成功生成.
+
+20201120周五
+（1）编写firmadyne_setup.py,针对testlink，infernetwork，输出networklist，生成image_IID dir,
+（2）修改针对testlink一组数据的generate_args_envs，拷贝dependence，包括proinfo_search_binary.ini
+（3）发现生成args_env会崩溃，调试发现崩溃在vmi.cpp VMI_remove_process。后将其中的delete iter->second放在process_pid_map.erase(iter)前面。******** important ******** ubuntu
+（4）自动化不需要输入密码 export PGPASSWORD=firmadyne，但是会导致电脑盒盖后输入密码认证失败。
+（5）process_map是erase cr3对应所有的条目，process_pid_map erase 当前对应的条目，可能会有问题？？？？ 后续考虑
+
+20201121周六
+（1）将ARGU_ANALYSIS的execve_analysis_vmi放在traverse_task_struct_add前面，不扫描task_struct
+（2）generate_args_env find_http中，要判断是否为可执行程序executable，解决10098没有args。
+（3）find_http find命令结果要strip掉最后的换行，不然会file 空报错。此外find结果可能为空，也要处理。
+（4）将坚果云上11.06的cpu-exec.c apply，并将文件目录相关的都加上handle_name, name的长度都设置为200.
+（5）FILE_ANALYSIS最后生成file_generate_success，表示成功完成文件生成。放在close_all_files（？？？）之前，因为该操作可能会出错中止
+（6）3250 S23uhttpd->etc/init.d/uhttpd,但没有调用usr/www/cgi-bin/uhttpd.sh,也就没有调用uhttpd。
+
+20201122周日
+（0）FirmAFL_new中，mount 的不仅是none要处理，ramfs等也需要处理
+（1）编写find_http.py生成httplist，编写ida_open_http.py自动化用ida打开所有http程序。
+（2）修改interface_fuzz_new/analysis.py,将之前的keywords_modify逻辑加入，并自动化判断当前分析image，生成对应的keywords文件。
+（3）analysis.py生成的keywords居然有不可打印字符，加入str_filter()过滤掉
+（4）编写run_afl.py，parse_args_envs中对参数有空格的，加上引号。
+（5）analysis.py，对本身字符串中包含\字符使用encode_string函数进行转义，replace("\\","\\\\"),不然会报错keyword \xNN，受影响的包括4416, 4528，9079，10202，11349,11614,13788
+
+
+crash 4416（afl_wait_tsl）8595，9079，9753, 9840,
+409 9451 hang
+10098 received signal outside
+10202 no var/run/httpd.conf
+4528 /usr/loacal/bin/php
+11143 参数错误。
+11349 unable to execute afl-qemu-trace
+3250 13028 fork server failed
+
+
+20201205 周六
+409，4416，8595（slow 7/s，没有nvram.conf），9079（uncaught signal 6, slow 6/s？),9753(slow？,没有nvram.conf),9840(slow？nvram.conf)
+9451(clone等问题？)
+10098(ok)
+10202（重新prepare_files， 就可以了）。
+4528（忽快忽慢？）
+11143（run_afl.py arg_encode中|转义）
+11349（。同105607，环境变量中不能有逗号，select failure，但可以正常运行）
+3250（同2904，uhttpd，只是输出不一样，也是先调用了recvfrom）， 13028（没有生成var/etc/nvram.conf）
+
+afl-fuzz.c中change_argv改成1000，run_target execve不用动
+run_afl.py中，（1）|转义， （2）环境变量中逗号去除。
+
+
+20201206 周日
+13028，（1）cpu-exec.c中，nvram文件需要生成。目前生成了也是不可读的；（2） main.c中，llseek socket逻辑，返回0。目前会不断的write，从特定缓冲区里读内容，该缓冲区内容一直在变化。后来分析没有问题，就是多次write，只不过现实多了。
+8595，（1）处理socket读的时候，将state！=-1改成state == 0，因为第一次读没有读到换行时还会再读一次。不应该触发handle_recvfrom, 145/s (2)nvram.conf是空的 （3）当按照9753改了之后，nvram不为空了，则会出现13028的问题 <10/s
+9079, （1）本身就没成功，初步观察有fork
+9753，（1）nvram.conf write length为40960，之前限定的4096长度。又出现了新的dev/mtdblock5/ 10/s
+9840，（1）main.c中，修改write输出逻辑，只输出一行。
+
+总结：
+13028， 8595， 9840就是很慢，因为多次write 
+9840和8595就是dlink-600和dlink-601
+9753 nvram就觉之后会出现open dev/mtdblock5
+
+编写generate_run_full.py自动生成run_full.sh，以及编写run_afl_full.py（由2.py改变过来）
+部署FirmAFL，其中vmi.cpp中需要修改，参照20201120（3）的修改。
+
+20201210 周四
+分析除http外的其它程序，
+10202: dnsmasq version 2.45
+failed to find list of interfaces <2.78
+
+4528:root password, nmdb, syslogd, ntpclient-wrapper,
+9079:no bash ping 不通
+8595：nmbd，udhcpc，
+9753:(和8595像）wantimer, llmnr,
+4353：dnsmasq version 1.18
+9840：tftpd
+9451：dnsmasq versoin 2.41 miniuppnd，dnsmasq 试了几个，42945和42946 exp成功。
+9451:smdb，445端口
+
+20201211 周五，
+重写所有.py,扩展到非http（如find_http -> find_program)
+9451 dnsmasq 执行unknown interface br0，
+(1)最开始有socket AF_NETLINK（16），了解其为与内核通信的方式。分析内核通信相关函数，认为是recvmsg的问题，分析send和recvmsg buf参数的结构，并输出内容，不可读。不是问题原因
+(2)然后找到dnsmasq的源码，分析，找到network.c下，indextoname函数，里面ioctl函数，当siocgifname时，根据第三个参数中的index，会返回接口名字。hook修改后问题未解决。
+（3）if_tmp->used不为真，导致的。
+
+20201212周六，
+firmadyne_setup.py，通过final_infer_new得到open_old, 并使用old makeNetwork.py生成run.sh
+(1)9079 80 53, 53端口没有exploit成功。 没有bash
+(2）409（admin,admin), dnsmasq 2.55 exploit未成功。其中 139 445 端口 smbd
+对httplist每一个httpd都生成了相应的进程与网络端口列表，保存在program-port中
+
+20201213周日，
+（1）重写所有.py,扩展到除dnsmasq之外更多程序。
+（2）修改ida_open_program.py和analysis.py。利用ida的-S“script.py arg1”的命令，再不打开ida的情况下直接生成关键字穿。（注意脚本前面要加入idaapi.autoWait()等待ida加载。idc.ARGV获取脚本参数）
+9136 telnetd accept之后 一直142
+3934 upnpd 120 error
+13761 telnetd 没有检测到启动
+4353 potval（mknod实现，可以运行，odd， check syntax），miniupnpd（listen的那个接口作为network_socket，正确运行）， telnetenable（正常运行，但只有两条路径）
+11614 vsftpd（55 fcntl 参数0，返回错误死循环），telnetd（link to busybody)
+13028 zebra,ripd accept之后segment fault 170 connect 全部都返回0.
+
+
+20201214周一，
+在lab机器上部署实验环境，上传几个项目到github上
+vscode，tmux了解和使用
+编写run_afl_noargs,考虑到link的情况，修改find_program函数，返回full_name和type_name（实际的程序名，如cgibin）
+
+20201215周二，
+run_afl.py, 加入no_args,no_files, pure_qemu
+修改iafind_executable.py, 保证link的是executable。
+
+20201216周三，周四、周五、周六
+思考测试什么程序
+（1）暂时不测试通用测试，一方面通用程序太多太杂，另一方面通用程序基本上可以直接运行，不需要网络、文件的支撑。
+（2）可能需要测试CGI，因为exploit-db上很多都是cgi的问题。
+（3）可以考虑测试一些本身问题很大的程序，如CVE-2020-9375 TP-Link Archer C50 v3 Denial of Service
+
+######################################## TPLINK ######################################
+exploit-db
+2020-11-05 WDR4300 AUTHENTICATED PING_ADDR
+2018-08-16 cve-2018-15172  WR840N 0.9.1.3.16 Authorization: Basic
+
+tddp可以重点测试
+
+CVE-2020-9375 Archer_C50v3_EU_0.9.1_0.6_up_boot\[171227-rel72331\].bin x(105569 80 closed) 有poc
+Archer C50 V3  HTTP? Referer in incorrect format
+https://thewhiteh4t.github.io/2020/02/27/CVE-2020-9375-TP-Link-Archer-C50-v3-Denial-of-Service.html
+https://www.exploit-db.com/exploits/48255 
+
+CVE-2020-8423  x（105570 8080 closed authenticated） 有poc
+wr841n httpd GET ssid long string
+https://ktln2.org/2020/03/29/exploiting-mips-router/
+
+CVE-2020-28877 no firmware (e.g. WR708N) latest is WR700N, WR系列固件无法解析?  有poc
+tddpd udp port 20002 报文过长
+https://github.com/peanuts62/TP-LINK-POC_2
+
+CVE-2020-28005 wpa4220v4_us-up-ver4-0-2-P1-20190326-rel45151-APPLC.bin x(105572 80 closed） 有poc
+TL-WPA4220 报文加密 type过长
+https://the-hyperbolic.com/posts/vulnerabilities-in-tlwpa4220/
+https://github.com/ocastejon/exploits/blob/main/cve-2020-28005/tplink-wpa4220-dos-exploit.py
+
+CVE-2020-15057 Single USB2.0 Port MFP and Storage Server TL-PS310U 105573 解压失败 no poc
+Users can crash the USB network servers by sending long input values 1103 characters
+https://research.hisolutions.com/2020/07/high-impact-vulnerabilites-in-multiple-usb-network-servers/
+
+CVE-2020-13224 NC200_2.1.7_Build_160315_Rel.27420_upgrade.bin 105574 nc450 105575 network不通， 有poc
+NCxxx could test.
+delmutiuser.gcgi username 过长
+https://packetstormsecurity.com/files/158115/TP-LINK-Cloud-Cameras-NCXXX-Stack-Overflow.html
+
+CVE-2020-10231 NC200, 和上面同固件 no poc，但可以构造
+NCxxx could test.
+/login.fcgi after successful login HTTP_USER_AGENT NULL， null pointer dereference
+https://packetstormsecurity.com/files/157048/TP-LINK-Cloud-Cameras-NCXXX-Remote-NULL-Pointer-Dereference.html
+
+CVE-2020-10881 a7v5_us-up-ver1-0-16-P1[20201029-rel43238].bin 105576 network不通， no poc
+DNS message
+https://www.zerodayinitiative.com/advisories/ZDI-20-333/ 
+
+CVE-2019-6989 need login
+TL-WR940N / TL-WR941ND FirmAFL搞过这个
+https://www.exploit-db.com/exploits/46678
+
+CVE-2019-17147  
+no details
+
+CVE-2019-13614 C1200 105577 network不通
+tddp Archer C1200 1.0.0 Build 20180502 rel.45702 类似于功能码
+https://fakhrizulkifli.github.io/articles/2019-07/CVE-2019-13614
+CVE-2019-13613 
+https://fakhrizulkifli.github.io/articles/2019-07/CVE-2019-13613
+
+CVE-2018-3951 authenticated
+CVE-2018-3950 authenticated
+CVE-2018-3948 not overflow
+
+######################################## Trendnet ######################################
+exploit-db 无
+CVE-2020-(14074, 14076, 14077, 14078, 14079, 14080)  有poc
+TEW-827DRU  ck ssi, apply.cgi, apply_sec.cgi
+
+CVE-2020-12763  无poc，可以构造
+TV-IP512WN 1.0R 1.0.4 sbin/rtsp long "Authorization: Basic" 解压失败
+
+CVE-2019-13280,13279,13276 TRENDNet  有poc
+TEW-827DRU H/W 2.0 F/W 2.04 80端口，均测试成功，但好像apply与apply_sec本身就会崩溃
+
+CVE-2019-11400  no poc
+TEW-651BR 2.04B1, TEW-652BRP 3.04b01, and TEW-652BRU 1.00b12 
+get_set.ccp ccp_act parameter ddns html. Ping不通
+
+https://github.com/tacnetsol/TRENDNetExploits
+http://downloads.trendnet.com/TEW-827DRU_v2/firmware/
+
+ntpq and ntpdc 4.2.8p11 Stack-based Buffer Overflow
+https://fakhrizulkifli.github.io/articles/2018-06/CVE-2018-12327
+
+######################################## Netgear ######################################
+netgear no detail 重点测试cgi
+Exploit-db  其他大多数都是命令注入
+2020-06-15 R7000 and many others upgrade_check.cgi 可构造
+2017-03-24 apply_noauth.cgi 可构造
+
+CVE-2020-28373 upnpd page removed
+CVE-2020-26925 no detail
+CVE-2020-26913 	no detail
+CVE-2020-15636 	RAE_Policy.json file  R6400, R6700, R7000, R7850, R7900, R8000, RS400, and XR300 routers
+CVE-2020-15417 R6700 V1.0.4.84_10.0.58 gui_region no authentication
+CVE-2020-10929 R6700 V1.0.4.84_10.0.58 no authentication
+CVE-2019-(20762-20767)R6700 no detail
+CVE-2019-(20751,20753,20754,20755) R6700 before 1.0.1.46
+CVE-2019-(20747,20748) no detail
+CVE-2019-20739 R8500, unauthenticated no detail
+
+######################################## Dlink ######################################
+exploit-db无新发现
+CVE-2020-9535 CVE-2020-9534   有poc
+DLINK DIR-615Jx10? boa？ 
+https://github.com/ladinas/Vulns_of_Embedded_Systems/blob/master/Two%20stack%20overflows%20were%20found%20in%20DIR-615Jx10.0%20Devices.pdf
+possilbe boa vulnerability could check other firmware
+1）dir network inferred失败
+（2) Trendnet 13112 no goform/formLogin
+（3）dap系列，106237 old 80 port close 169.254.230.134
+	22/tcp   open  ssh
+	111/tcp  open  rpcbind
+	2003/tcp open  finger
+	3389/tcp open  ms-wbt-server
+	5432/tcp open  postgresql
+
+	18428 同样， boa运行就crash，80 closed
+看gpl源码也没招fmwlan.c的固件
+
+
+CVE-2020-9276 D-Link D-Link DSL-2640B B2 EU_4.01B 无poc，可以构造 长cgi直接崩溃
+----d-link-dsl-2640b HTTP?---do_cgi-buffer-overflow getarch就失败了
+https://raelize.com/posts/d-link-dsl-2640b-security-advisories/#cve-2020-9276
+20017 DSL-2640B no network inf end of life 
+Dsl-2740b系列（19359）访问http 192.168.1.1直接crash。 EOL
+Dsl-2770L系列（20276）kernel hang住了，http没有启动
+
+CVE-2020-8962 DIR-842 REVC with firmware v3.13B09 usr/sbin/mtfwu  有poc
+https://ctrsec.io/index.php/2020/02/12/cve-2020-8962-d-link-dir-842-stack-based-buffer-overflow/ 固件加密了
+CVE-2020-8962 DIR-842 REVC with firmware v3.13B09 usr/sbin/mtfwu
+只有105595 3.13b05有mtfwu,可以ping通,但是这个漏洞只有3.13b09hotpatch有。
+
+CVE-2020-15892 D-Link DAP-1520 devices before 1.10b04Beta02 ssi 1.0.8 & 1.10B04 有poc，验证成功
+log_pass long
+https://research.loginsoft.com/vulnerability/classic-stack-based-buffer-overflow-in-dlink-firmware-dap-1520/
+
+CVE-2020-10214 D-Link DIR-825 Rev.B 2.10  CK 有poc 验证成功
+https://github.com/kuc001/IoTFirmware/blob/master/D-Link/vulnerability4.md
+
+CVE-2019-9125 D-Link DIR-878 1.12B01 no poc HNAP_AUTH http header no authentication
+加密  1.04b05未加密 1.10已经加密 未加密infer也失败了 1.00版本有不能infer
+DIR-867-US v1.10b04 & Below 1.00b07版本也不能解压
+DIR-878	   v1.20b03_Hotfix & Below 新kernel可解压但无法infer
+DIR-882-US v1.10b04 & Below 新kernel可解压但无法infer
+page disapeear MISC:https://github.com/WhooAmii/whooamii.github.io/blob/master/2018/DIR-878/overflow1.md
+https://supportannouncement.us.dlink.com/announcement/publication.aspx?name=SAP10163
+
+CVE-2019-6258 DIR822B1 - 202KRb06  no poc
+https://github.com/pr0v3rbs/CVE/tree/master/CVE-2019-6258 xml处理
+
+CVE-2019-10999 fuzzwalls DCS network not inferrable wireless.htm 有poc
+alphapd, the camera's web server
+DCS 9XX DCS5XXX系列 
+https://github.com/tacnetsol/CVE-2019-10999   
+dcs 3个 infer的(dcs5010l,dcs-800l)，20556，在家里机器上也试了，都不能ping通
+
+CVE-2019-10892 D-Link DIR-806 xuanwu meizi disappered no poc
+ /htdocs/cgibin long header 
+
+####################download url#######################
+(1)dlink: considering 
+https://support.dlink.com/AllPro.aspx not included
+http://files.dlink.com.au/products/ include dir-825 2.06b05
+https://ftp.dlink.ru/pub/ more not only routers
+ftp://ftp.dlink.eu/Products/ include  DAP-1520 108B01, dir-825 2.06b04 priority
+https://github.com/MikimotoH/DLink_Harvester/blob/master/eu_dlink_filelist3.csv the summary of above !!!!!!!!!
+ftp://ftp2.dlink.com/
+https://github.com/MikimotoH/DLink_Harvester 所有dlink的收集整理。
+http://legacyfiles.us.dlink.com/DAP-1520/REVA/FIRMWARE/ dap-1520 1.10b04 最新版
+ftp://ftp2.dlink.com/PRODUCTS/ 最新的。
+
+(2)tplink should include  WDR7400, WDR7500, WDR7660, WDR7800, WDR8400, WDR8500, WDR8600, WDR8620, WDR8640, WDR8660, WR880N, WR886N, WR890N, WR890N, WR882N, and WR708N
+https://www.tp-link.com/hk/support/download/ not included 
+https://www.tp-link.com/us/support/download/ more, but wdr models are still not included !!!!!!!!!
+(3)trendnet http://downloads.trendnet.com/ !!!!!!!!!
+(4)netgear 同样参考https://github.com/MikimotoH/DLink_Harvester
+###############################################################
+
+####################tested firmware#######################
+wr1042 105579 192.168.0.1 port 1900
+TEW-827DRU 2.04 105580 192.168.10.1 old CVE-2020-14074 exploit successful.
+TEW-827DRU 2.00 105581 192.168.10.1
+DCS-5020L 105582  no network	
+DCS-930L 105583	no network
+DAP-1520 105585  v1.00b21 old 192.168.0.50
+DAP-1520 105586 108B01 old 192.168.0.50
+DIR-825 105587 2.06b05 192.168.0.1 crash after login
+DIR-825 105588 2.10b02 192.168.0.1 problem loading page
+DIR-842	105590 3.13B09 failed extraction firmware encrpted
+DIR-842 105595 3.01B05 192.168.0.1 CVE-2020-8962 没有成功，应该只有那个hotpatch有这个问题。
+DSL-2640B 105596 B2 EU_4.01B getarch失败，且makeImage之后里面没有executable
+DIR-615 105597 4.14B02 network inferred failed
+cve details不全，用https://cve.mitre.org/cve/search_cve_list.html搜索
+###############################################################
+
+####################sucessful exploitation#######################
+需要进一步分析program, args_file, files_need?
+successful exploitation 
+CVE-2020-15892 D-Link DAP-1520 108B01 ssi 105586
+CVE-2020-10214 D-Link DIR-825 2.06b05 sbin/httpd 105587 需要authentication
+CVE-2020-14074系列 Trendnet TEW-827DRU 2.06B04 www/cgi/ssi
+CVE-2019-13280系列 Trendnet TEW-827DRU 2.06B04 www/cgi/ssi http://192.168.10.1?apply.cgi直接就崩了
+###############################################################
+
+
+
+周五
+url要strip()
+要判度firmware大小，方法根据型号而异
+awk \'{print $NF}\' $NF最后一项
+os._exit(1),错误推出，更能知道发生了错误 
+size要int()转换
+
+编写firmadyne_setup4.py,对4个品牌firmware进行setup
+对于makeNetwork.py,不再将interfaces输出到guest_ip, 因为跑多个firmadyne_setup4.py会出现错误，因此直接popen命令然后进行分析。
+firmware Decrypt
+https://www.thezdi.com/blog/2020/2/6/mindshare-dealing-with-encrypted-router-firmware
+
+周六
+subprocess.Popen相较于直接popen，extractor.py不会出错。
+netgear url中有逗号，而分割符是逗号，需要另作处理，详见netgear.py
+postsql在execute sql之后要database commit
+extractor.py需要有超时设置
+wget也需要有超时设置 -T 20 -t 1，重试次数也需设置为1。
+md5是为了检测固件是不是成功下载了，因为有的时候会ctrl c跳过。
+wget设置 -T 600 -t 1，防止下载时间过长
+
+12.21周一，
+firmadyne_setup4因为数据库id冲突停止了。
+CVE分析收尾（每个cve，影响的程序，是否有poc都注明）,更新firmadyne_scripts与exploit到github.
+
+12.22周二，
+infer特别慢，因此考虑用docker。
+docker按照官网更新，然后倒入之前的docker_image,安装需要的库后，通过docker commit命令更新固件
+本来想在docker中将infer的结果写到文件中，但所有流程都需要数据库操作，且image_id无法统一统一，因此在docker中访问本地数据库。
+本地数据库默认禁止远程访问，通过修改/etc/postgresql/10/main下的postgresql.conf与pg_hda.conf实现远程访问，systemctl restart postgresql
+由于docker内没有dev/loop，因此仍在本地进行makeImage，在docker中进行耗时的network infer
+编写firmadyne_makeImages.py与firmadyne_infer_docker.py进行本地makeImage和docker范围network infer
+（fimadyne_setup4.py与firmadyne_setup_docker.py deprecated）
+
+很多固件如：DHP-500AV_fw_revA_v1-02b02_all_en_20120724.zip extract的时候卡住，应该是popen的原因，单独执行不会。先绕过。
+
+12.23周三，
+105586 ssi args生成失败，分析后发现是firmadyne kernel更新为2.6.39.4+ ，原有procinfo.ini无法使用。
+（1）重新计算init_task 等，用网页计算器出错耽误了很久
+（2）linux_vmi_new.cpp中，execve_analysis_vmi中 addr与env在新kernel中的寄存器也发生了改变。
+（3）还是用回2.6.32.70（硬盘里有），因为procinfo.ini除了proc_exec_connector地址变量变了，其它变量也发生了改变。（2）也进行撤销
+（4）分析其他ssi是否存在漏洞，如下
+（5）编写run_normal.py，系统仿真程序然后用于分析待测程序（执行pc，系统调用等）
+（6）解决105568 ssi单程序的运行，如下
+
+-------------分析不同型号的ssi程序，发现漏洞----------------
+
+/bin/ssi CVE-2020-15892
+18503 run kernel error 
+16032 TEW-737 cannot ping 
+106234  dap-1620 1.04 old OK
+18979 dap-1520 1.01
+106230 dap-1520 1.06
+18504 dap-1320 2.02b01 cannot ping old
+18980  dap-1520 1.04
+105585 no results
+18508 dap-1320 2.02b01 
+106231 dap-1520 1.07
+18497 dap-1320 1.11  cannot ping old
+
+ssi
+13142  tew-732 cannot ping 
+105950 TEW-825DAP CVE-2020-14080 OK 正常apply_sec不会崩 192.168.10.100
+106013 tew-755ap CVE-2020-14080 OK
+105958 TEW-823DRU network infer failed
+105581 no results
+105970 TEW-821DAP CVE-2020-14080 OK CVE-2020-14079 no
+105931 TEW-827DRU 2.05B this model tested
+106014 TEW-755AP 1.04B06 this model tested
+107625 DWL-6700  network infer failed?
+105932 TEW-827DRU 2.04B03 this model tested
+106019 TEW-755AP 107B07 this model tested
+20796 DIR-655 old ping test no CVE  see the message in the log
+106016 TEW-755AP this model tested
+12880 TEW-658BRM network infer failed
+106015 TEW-755AP CVE-2020-14080 OK
+105580 ORIGNIAL TEW-827DRU
+13141 TEW-732BR cannot ping 
+106055 TEW-722BRM network infer failed
+13067 TEW-722BRM network infer failed
+105943 TEW-825DAP this model tested
+13297 TEW823DRU network infer failed
+
+---------------105586 ssi分析--------------------------------------
+CVE-2020-15892 D-Link DAP-1520 108B01 ssi 105586 
+（1）isatty return -22, 就可以绕过
+before syscall end:4054, ret:22, error:1
+ioctl request:540d, 7fc7bdd8
+
+（2）根据put_querystring_env关键字发现 post的data是read fd=0读进来的。
+
+（3）nvram得绕过
+
+---------------105950 ssi分析--------------------------------------
+105950 TEW-825DAP CVE-2020-14080 OK 正常apply_sec不会崩 192.168.10.100 www/cgi/ssi
+read fd=0处不断循环。
+run_afl.py中环境变量 HTTP_ACCEPT_ENCODING=gzip deflate 对空格进行转义 replace(" ", "\ ")
+run_noraml之后，发现read的长度参数在read之前就确定了。
+
+12.24周四，
+生成新的procinfo.ini，而不是只改动里面的地址值，还有偏移值。最后用的vmlinux_mipsel_2.6.39.4_procinfo
+（1）安装musl-cross, 安转过程中wget -c去掉，要提供checksum
+（2）按要求编译（不需要make menuconfig）SYSCALL_DEFINE3/2注释的kernel，偏移值不会改变
+（3）make modules与make modules_install,生成/lib/modules/xxx,用于编译版本适配的procinfo.ko，移殖到FILE_LOAD,并在9050，12978中得到procinfo
+然后新的固件TEW-825DAP（105950）可以在新kernel下infer，并发现read的参数之前就确定了。
+编写find_program_details.py
+
+105950 TEW-825DAP CVE-2020-14080 OK 正常apply_sec不会崩 192.168.10.100 new? mipseb www/cgi/ssi etc/resolv.conf不存在，但不影响 
+105586 CVE-2020-15892 D-Link DAP-1520 108B01 ssi  192.168.0.50 old mipsel libnvram.so
+105587 CVE-2020-10214 D-Link DIR-825 2.06b05 sbin/httpd libnvram.so
+20194 dir-865 MAYBE CVE-2019-9125 D-Link DIR-878
+准备image.tar.gz 和导出数据库，用于在家里测试。
+
+12.25 周五
+数据库非图形界面访问与备份
+psql -U firmadyne -h localhost -d firmware
+pg_dump firmware  -h localhost -U firmadyne -t image_new  > backup.sql
+
+tplink >50M 固件下载
+错用firmadyne_setup4.py，应该用firmadyne_makeImage.py
+Info是下载列表，already_handle才是已分析列表。
+发现dlink与其它厂商都有gpl source code可分析，进一步确定其余漏洞不存在。
+firmadyne_docker_infer一直在跑，只要firmadyne_makeImagec处理完就会infer。
+深入dlink的cve，基本排除可以使用的固件。
+
+12.26周六，
+（1）编写爬虫 dlink_sup.py
+
+（2）exploit报文明确：改写CVE-2020-10214.py，直接用socket.connect和send明文的方式，发现一直不成功，还用wireshark对比报文，搞了一下午意识到是要用两个socket进行发送。而header只需要注意保证Content-Length是payload的长度即可。
+
+（3）nvram处理。在generate_args_envs中，DECAF_read_mem返回-1，是因为读100个字节，没有这么长所以返回-1，而不是没有读到内容，因此注释掉if(ret!=-1)，这样生成的envs中包含-E LD_PRELOAD=/firmadyne/libnvram.so
+
+（4）改写main.c，是的可以在认证后进行exploit
+syscall read， recv recvfrom，输入 network login package
+为了对105587进行二轮测试，加入test_round，并设置为1.
+在142，188中，当state=2且round小于test_round，则讲state重置为0，并将network_socket重置为accept_socket
+
+
+12.26周日
+（1）看了源码，read的第三个参数来与content_length，slt的第三个参数几位content_length的关联变量。
+syscall==3 175 176的a0=0的逻辑中进行修改
+
+（2）simplify the exploit，找到最简的触发漏洞的输入，并generate seed和crash，放入seeds目录下
+
+（3）post_data_flag为1时，则说明输入数据为post的data部分，则不经心check_http_header.
+
+（4）进行fuzzing结果如下：
+105587的httpd会hang住而不会crash
+105950的gethostbyname会socket connect dns服务器（根据resolv.conf配置），对于这种
+具体：linux系统处理名称解析详解（图不错）
+https://blog.arstercz.com/linux-%E7%B3%BB%E7%BB%9F%E5%A6%82%E4%BD%95%E5%A4%84%E7%90%86%E5%90%8D%E7%A7%B0%E8%A7%A3%E6%9E%90/
+105586直接在pure下成功执行。
+
+（5）解决105950的问题，对mian.c进行大改，并保存老版本的main_20201227.c，
+port端口要Htons才是真实的
+加入test_port，默认为80，只有当bind为80端口才add_network_fd.其余为普通网络socket，使用if_exist_network_fd2判断
+if_exist_netowrk_fd2的逻辑即为在ori_network_socket与当前network_socket之间。
+因此普通网络socket在142 188下直接进行操作，而不发生状态改变。
+
+（6）成功fuzzing出新的crash，105587和105950？仍然会hang，后续解决。
+
+12.27周一，
+（1）验证crash，ssi均验证成功，http的未成功。ssi均在其它型号找到漏洞。
+1)www/cgi/ssi
+105950 CVE-2020-14080 TEW-825DAP 1.09b03 均可以触发（记得该content_length) test-2020-14080.py  (ori: TEW-827DRU 2.06B04) 
+unknown action会造成 crash， long key也会造成crash
+TEW-827DRU还没有测试，最新版不能infer
+105962;"FW_TEW-822DRE_v1_v2(1.03B02).zip" 没有漏洞
+106046;"TEW-730APOv1_(FW1.1.1).zip" 没有漏洞
+105969;"FW_TEW-821DAP_v2(2.02b01).zip"   v2 最新版  没有漏洞 
+
+106018 FW_TEW-755AP_v1(1.11B03).zip  最新版 测试成功  不再受CVE-2020-14080影响
+105975, 'FW_TEW-821DAP_v1(1.11B03).zip'  v1 最新版 测试成功 不再受CVE-2020-14080影响
+105951;"FW_TEW-825DAP_v1(1.11B03).zip" 最新版 测试成功
+FW_TEW-827DRU_v2(2.07B02).zip 最新版，不能infer
+有个共同点，固件下载处都有
+Notes:
+    Fixed security vulnerabilities
+
+分析106018 www/cgi/ssi
+vul 1: 'A'*1000+'='  crash at 0x40dcd0 fprintf "%s: key len = %d, too long\n"  "secure_len_key_value"
+vul 2: action=  action=sss  crash at 0x40f110 GPL_SSC_OBJS is 0 load would failed
+
+
+0x40eb98分析出 SSC_SEC_OBJ 指向以下keywords
+content:do_graph_auth
+content:setup_wizard
+content:setup_wizard_ap
+content:setup_wizard_cancel
+content:setup_wizard_skip
+content:setup_wizard_mydlink
+content:wizard_wlan
+content:wizard_wan
+content:ping_test
+content:ddns_wizard
+content:response_page
+content:lang
+
+vul 3: action=ping_test without ping_ipaddr getenv NULL， crash at strtok 43923c (should be ping
+vul 4: action=lang&  action=lang  action=lang&languag= crash at 0x44285c getenv language NULL (should be language)
+vul 5: action=do_graph_auth  crash at 0x408940 atoi getenv session_id  NULL (should be session_id)
+vul 6: action=do_graph_auth&session_id=123 crash at 40690c (should have login_name)
+
+如果action=xxx&后面没有 = ，则不是完整的请求，无论action是什么，都会变成response_page
+
+content:setup_wizard_cancel
+content:setup_wizard_skip
+content:openvpn_get_keys
+content:ping_test
+content:tools_diagnostic
+content:tools_netstat
+content:tools_nslookup
+content:tools_admin
+content:tools_ssl
+content:set_pcl_schedules
+content:wan_rus_l2tp
+content:wan_rus_pptp
+content:wan_rus_poe
+content:wan_multipoe
+content:wan_rupoe
+content:wan_rupptp
+content:wan_poe
+content:wan_pptp
+content:wan_l2tp
+content:wan_static
+content:wan_dhcp
+content:lan
+content:lan_revoke
+content:dmz
+content:tools_ddns
+content:ddns_wizard
+content:adv_opendns
+content:restore_defaults
+content:reboot
+content:wireless
+content:wds
+content:wds1
+content:wireless_2g
+content:guest_zone
+content:guest_zone_5g
+content:gzone_concurrent
+content:wlan0_multi_ssid
+content:wlan1_multi_ssid
+content:wlan0_mac_filters
+content:wlan0_mac_filters_kick
+content:wlan1_mac_filters
+content:wlan1_mac_filters_kick
+content:adm_stp
+content:adv_portforward
+content:adv_appl
+content:adv_filters_mac
+content:adv_acl_service_block
+content:adv_acl_url_filter
+content:adv_bandwidth
+content:adv_wlan_perform
+content:adv_wlan0_perform
+content:adv_wlan1_perform
+content:pppoe_connect
+content:ru_pppoe_connect
+content:dhcp_connect
+content:adv_dmz
+content:adv_alg
+content:adv_dos
+content:adv_access_control
+content:tools_schedules
+content:adv_qos
+content:response_page
+content:certificate_create
+content:static_route_edit
+content:wps_action
+content:dynamic_route
+content:policy_route_edit
+content:url_domain_filter
+content:timeset
+content:cmo_timeset
+content:adv_virtual
+content:adv_network
+content:tc_wireless
+content:coovachilli
+content:adm_snmp
+content:adm_led
+content:smbserver
+content:ftpserver
+content:samba36
+content:openvpn_server
+content:proftp
+content:unmount
+content:start_cap
+content:stop_cap
+content:bt_setup
+content:tools_syslog
+content:st_log_setting
+content:send_log_email
+content:adv_wps
+content:adv_wps1
+content:restore_default_wireless
+content:set_sta_enrollee_pin_24g
+content:set_sta_enrollee_pin_5g
+content:virtual_push_button_24g
+content:virtual_push_button_5g
+content:wireless_5g
+content:wizard_wlan_concurrent
+content:wlan_concurrent
+content:wlan_vlan
+content:wlan_vlan_snmp
+content:wlan_band_steering
+content:airtime_fairness
+content:st_dev_connect
+content:st_dev_disconnect
+content:st_dev_rconnect
+content:reset_ifconfig_packet_counter
+content:usb_setting
+content:itune_media
+content:http_media
+content:http_media2
+content:lan_port_disable
+content:wizard_device_type
+content:device_type_change
+content:wizard_pppoe
+content:wizard_admin_password
+content:wizard_wan
+content:get_trx
+content:wan_usb3gphone
+content:wan_usb3gadapter
+content:adv_inbound_filter
+content:adv_wish
+content:ipv6_ap
+content:adv_ipv6_static
+content:adv_ipv6_poe
+content:adv_ipv6_6in4
+content:adv_ipv6_6to4
+content:adv_ipv6_autodetect
+content:adv_ipv6_autoconfig
+content:adv_ipv6_link_local
+content:adv_ipv6_6rd
+content:adv_ipv6_ula
+content:adm_set_encrypt_pass
+content:wizard_ipv6
+content:adv_ipv6_firewall
+content:adv_ipv6_routing
+content:ping6_test
+content:reject
+content:download_fw_lp
+content:auto_up_fw
+content:auto_up_lp
+content:wan_dslite
+content:ap_lan
+content:user_limit
+content:reboot_needed
+content:create_folder
+content:http_storage
+content:upnp_start
+content:upnp_stop
+content:sb_bandwidth
+content:wifi_opmode
+content:wireless_opmode
+content:wifi_network
+content:wifi_bandwidth_control
+content:wifi_captive_portal
+content:wifi_captive_portal_login
+content:wifi_captive_portal_user_list
+content:wifi_check_rssi
+content:wifi_online_timer
+content:wifi_profile
+content:del_wifi_vap_profile_schedule
+content:sta0_profile
+content:sta1_profile
+content:sta_profile
+content:wifi_wps
+content:virtual_push_button_wifi0
+content:virtual_push_button_wifi1
+content:set_sta_enrollee_pin_wifi0
+content:set_sta_enrollee_pin_wifi1
+content:wifi_advanced
+content:add_wifi_maclist
+content:del_wifi_maclist
+content:kick_ban_wifi_mac_allow
+content:kick_ban_wifi_mac_deny
+content:changes_review
+content:cli_settings
+content:add_wifi_schedule
+content:del_wifi_schedule
+content:wifi_schedule
+content:icp_delete_img
+content:icp_setbg_img
+content:icp_setlogo_img
+
+2)
+105586 CVE-2020-15892  D-Link DAP-1520（EoL） 108B01 old lighttpd 192.168.0.50
+tkn ; %等组合会造成crash，分析二进制和gpl源码（ssc.c、querys.c),源码（没有tkn)和二进制并不完全一致。主要原因环境变量html_response_page为空，而后面输入的值导致s1寄存器仍然是NULL，然后进行strstr(res, "../")崩溃掉。
+测试最新id:109517 DAP-1520_REVA_FIRMWARE_1.10B04_BETA02_HOTFIX old 测试了所有crash input在新的固件中不存在。
+(106236, 'DAP-1620_fw_revA_1-03_eu_multi_20160317.zip' 存在
+新版109518 DAP-1620 DAP-1620_REVA_FIRMWARE_PATCH_v1.06B04_BETA  不存在
+DAP-1320 官网下架
+DIR-652(EoL) DIR-655(EoL) DHP-1565(EoL) 
+DIR-825
+109519 http://dlink.co.in/firmware/ftp.aspx index.cgi 测试成功 dir-825 E1 ATC
+109520 https://www.dlink.com.sg/dir-825-2/ infer失败
+
+3)
+105587 CVE-2020-10214 D-Link DIR-825 2.06b05 sbin/httpd libnvram.so
+验证了hang的input，不能触发漏洞。
+
+（2）find boa和hydra的固件以及端口开放情况
+------------------------------------boa-------------------------------
+'13112', 'FW_TV-IP121WN_V2(1.2.1.17).zip' 以前测过，很多cgi
+'13488', 'TEW-820APv1(FW1.00B16).zip' boa一直crash
+'106238', 'DAP-1665_fw_revA_1-14b06_eu_multi_20151216.zip' 98.114.48.0 boa 一直crash 和上面同源？
+'107804', 'D6000_V1.0.0.61_1.0.1.zip port filtered
+'107806', 'D6000_V1.0.0.41_1.0.1_FW.zip' port filtered
+'3237', 'WNR1000 Firmware Version 1.0.1.15 (North America).zip' admin passord 有许多cgi
+'105957', 'FW_TEW-822DRE_v1&2(1.01B06).zip', 'TEW-822DRE_v2' get apply_sec.cgi直接就崩了
+'4500', 'WPN824v3 Firmware Version 1.0.8_1.0.6 (North America).zip'   cgi-bin/proccgi
+'3815', 'WN2000RPT-V1.0.0.2NA.zip', 'WN2000RPTv1' cgi-bin/proccgi
+'7180', 'WGR612-V1.0.1.3_1.0.1PR.img' 80 closed 
+'18627', 'UK_101b02.bin', 'dsl-2740r' 有cgi proccgi
+'109354', 'DGS-1100-08PD_REVB_FIRMWARE_v1.00.006.zip' 80 closed
+'107799', 'D3600_V1.0.0.59_1.0.1.zip' filtered
+
+
+------------------------------------hydra-------------------------------
+'106037', 'TEW-738APBOv1_(FW1.1.9).zip'  Your client does not have permission to get URL / from this server. 
+'13155', 'FW_TEW-455APBOv2(2.1.3)_FCC.zip' ping failed
+'13308', 'TEW-676APBOv1(FW1.02).zip' ping failed
+'20022', 'DAP-3310_fw_revA2_1_10_rc_19_eu_en_20141111.zip' ping failed index.cgi Save.cgi
+
+
+12.29周二
+（1）分析NETGEAR各类型型号80端口的开放情况，最终找到三款并生成fuzzing所需seed
+108067 WNDR4300 80 closed
+3259 WN2500RP PING FAILED
+3244;"WNDR3400-V1.0.0.52_20.0.60.zip" old 80 closed
+108016;"R7800-V1.0.2.12.zip" arm
+108362;"EX6100v2-V1.0.1.46.img" arm
+2253;"EX2700-V1.0.0.16.zip" http close soon
+107872;"EX2700-V1.0.1.10.zip" http crash when access
+NEW 109521 ex2700-v1.0.1.58 http crash when access uhttpd
+107769;"LG2200D-V1.0.0.57_1.0.40.zip" OLD 80 closed
+DGND DGN 4854 16513 httpd start carsh 
+R6100 107968 old could not infer  ping failed
+D3600 D6000 filtered
+WNR 1000 ok (3237 latest version admin password procgi) 2000v5 filtered 2200 filtered wnr612 filtered 
+WND 930(109522 latest admin password ) ok
+WNDAP 350(end-of-life) ok
+JNDR3000 httpd start crash
+JNR 3300 (109523 latest 1.0.0.34 password) ok
+JR ping failed
+WAC120 2522 why WND930
+总结可以测试 
+WNR1000v1 3237 mipseb， bin/boa 192.168.1.1 eval "`/www/cgi-bin/proccgi $*`" miniupnpd
+WND 930 109522 mipseb, etc/lighttpd 192.168.0.100 phpsessionid
+JNR 3300 109523 mipseb, /usr/sbin/uhttpd（本服务器不支持您的客户端请求的操作） miniupnpd
+vulnerability
+https://speakerdeck.com/l4ys/netgear-bug-bounty?slide=42
+https://www.thezdi.com/blog/2020/6/24/zdi-20-709-heap-overflow-in-the-netgear-nighthawk-r6700-router
+
+（2）DIR很多固件以及end of life
+106913 DIR-842
+
+（3）进一步分析105587 D-Link DIR-825  是否有除 CVE-2020-10214（get_cgi到sprintf）之外的sprintf漏洞，
+1)首先找到cgi和handler的关系,生成tmp_syscall
+pc: 40cb20 jalr t9 t9 = ldr (s2+0x10) = 0x10000838
+pc: 413ddc 
+40c840 block执行结束后 s2偏移0x18(间接调用结构体的大小）到0x40c7ec，
+其中s2+0处存放的是cgi字符串的地址，s2+0x10存放的是处理函数地址。
+
+2）以下几点可能存在问题！！！！！！！！！！！！！！！！！
+419dec b64decode
+41afd4 strcpy
+
+12.30周三，
+（1）直接搜索路由器 溢出 漏洞，找到更多的漏洞模式，静态分析出新漏洞，再去apply测试可能更有效。
+upnp，dhcpd，tenda可以进一步分析
+Uhttpd受openwrt影响
+https://openwrt.org/advisory/2020-01-13-1 漏洞 OpenWrt versions 18.06.0 to 18.06.5 are affected
+https://www.cnblogs.com/zmkeil/archive/2013/05/14/3078766.html uhttpd流程
+
+tenda
+https://wzt.ac.cn/2019/03/19/CVE-2018-5767/
+
+netgear r6700 exploit
+wangan.com/articles/194
+
+CVE-2018-20056 DIR-619L&605L POST /goform/formLanguageChange sprintf
+https://xz.aliyun.com/t/5699 
+
+CVE-2018-18708 tenda arm
+https://www.anquanke.com/post/id/204403
+
+漏洞组合拳 snprintf
+https://paper.seebug.org/269/
+
+Iot安全资料整合
+https://github.com/H4lo/IOT_Articles_Collection/blob/master/Collection.md
+
+
+dhcp module TP-Link WR886N
+https://github.com/PAGalaxyLab/VulInfo/blob/master/TP-Link/WR886N/inetd_task_dos_13/README.md
+
+x86架构的路由器
+https://www.freebuf.com/articles/wireless/168063.html
+
+R8000 vulnerability upnp的漏洞
+https://paper.seebug.org/1311/ 
+
+R6400 upnp CVE-2020-9373 WNDR2400v3 也由此漏洞
+https://www.freebuf.com/vuls/228293.html
+https://github.com/reevesrs24/CVE/blob/master/Netgear_WNDR2400v3/upnp_stack_overflow/upnp_stack_overflow.md
+'106037', 'TEW-738APBOv1_(FW1.1.9).zip' upnp端口没开
+
+dhcpd 105569 Archer C50 V3
+
+uhttpd 非netgear brand_id 33
+'105927', 'FW_TEW-827DRU_v2(2.00B09).zip' 192.168.10.100
+
+六款开源路由器。
+https://www.sohu.com/a/221312764_610730
+
+
+（2）发现测试很多inferred成功固件都不一定能ping通或者端口开放，于是先编写firmadyne_port.py，批量生成nmap结果
+
+
+12.31周四
+编写SOCKET链表，和增删改查，type=0，普通network fd, type=1,目标network fd
+加入remove_network_fd(),close fd的时候使用。
+Bind 80端口，则是目标network fd
+188 142 get_newest_network_fd() 获得当前最后加入且没被删除的network fd
+
+
+1.1周五
+（1）编写firmadyne_port_old.py,firmadyne old的infer。
+（2）试图跑起来9136，遇到AF_UNIX socket的问题，分析了一会儿，先不管让其跑。
+（3）分析9136测试不到漏洞（，CVE-2016-1558）原因，是seed有问题，需要满足三要素，
+GET, session_login.php, dlink_uid=
+
+（4）分析新漏洞存在的固件版本，挨个测试
+2330 1.07rc 存在漏洞
+2330 1.10rc 不存在
+2360 有A版本
+2360 2.07 有漏洞
+2360 2.10 不存在
+2360 3.00 could not infer
+2553 3.06 mipseb 有漏洞
+2253 1.32 mipsel old 没有漏洞
+2565 EoL
+2610 2.01 armel 和其它不一样
+2660 1.13rc074 有漏洞
+2660 1.15rc093 没有漏洞
+2660 1.15rc131 kpatck（1.15rc118）上面一个版本 没有漏洞
+2660 2.00 could not infer
+2680 （1.00与2.00) 2682(1.00)解压失败
+2690 A版本 12年的，有点老，可以测试
+2690 B版本，3.16 有漏洞
+3.20rc106（krack下面一个版本）没有漏洞
+2695 1.17rc063（S）有漏洞
+2695 1.20rc075 kcrack下面一个版本，猜测没有
+3320 1.01 有漏洞
+3666 解压失败
+X1870 解压失败
+
+（5）继续连夜测试9136，发现只测到CVE-2016-1558，没有测到新漏洞。
+
+2021.1.2 周六
+（1）9136没有测到upload_ca_int新漏洞原因分析
+新漏洞脚本也需要包含HOST：不然也不能触发。
+9136 httpd 需要 connect socket file并read和write成功才能拿触发upload_ca_int漏洞
+socket file是var/run/xmldb_sock，prepare_files没有生成成功，分析后应该是socket方式新建的。
+最后考虑不建立socket文件，而是直接默认返回成功，读写内容不用管。
+触发位置是在upload_certificate中，引用upload_file中的地址为null，导致strrchr失败。
+Dlink 详细流程后续可以看。
+https://ray-cp.github.io/archivers/d-link-getcfg_php-info-leak
+一下是ls -al可能出现的结果
+d： 目录
+b： 块特殊文件
+c： 字符特殊文件
+l： 符号链接文件
+p： 命名管道文件FIFO
+s： 套接字文件
+buffer overflow检测函数列表
+http://www.qnx.com/developers/docs/6.5.0SP1/com.qnx.doc.ide.userguide/topic/memory_Buffer_overflow_.html
+
+
+（2）分析105586 lighttpd怎么调用的ssi。
+看到plugins_call_handle_uri_clean没，在lighttpd源码中分析过，应该是可以自定义实现的。execve完后直接就会到了sigemptyset。
+
+（3）测试105586 CVE-2020-15892情况，dap-1520已经官网告知EoL， 1620也存在漏洞，但是早起就fix掉了。
+Dap-1325-us 1330 1610 infer 失败 1530-us解压失败、1755（没有firmware）、1820（解压失败）、1955（解压失败）
+成功infer：
+1620 （105607） 1.04.b04beta03 old 有tkn 没有漏洞已修复，最新的版本也么有 （105612 1.01.b05 105613 1.01b04 有漏洞） 
+1650 9992 1.02B02  没有漏洞  session.cgi
+1665 很多版本，1.16b01 没有ssi，有rssi
+1720（infer成功）
+感觉CVE-2020-15892很难找到同源漏洞，看来还是DIR-825的非DAP幸好靠谱。
+
+（4）全面分析DIR的port情况
+DIR-605 infer false
+DIR-822L DIR-867 DIR-878 DIR-879 DIR-882 DIR-L DIR-X DIR-2XXX DIR-3XXX没有记录
+DIR-640L 1.02b02 infer 成功 10887 192.168.123.254 system error, reboot.
+DIR-842 2.02 infer success 最新版不能解压 3.00B18 (105616) httpd hedwig.cgi, cgibin.
+DIR-869 1.02 infer success 1.03b02 (105617) 169.254.62.177 http hedwig.cgi cgibin
+
+DCS-5010L DWR-921 GO-RT-AC750 infer success
+ 
+cgi系列
+Dir-816L，dir-865, dir-845
+
+没有cgi Dir-640,ir-510l,dir-626l 
+但不是boa。
+希望找到port开放的boa，然后查找 /goform/formLanguageChange sprintf 问题
+
+my_cgi.cgi
+Dir-505l
+
+wfadev.cgi
+Dir-300,dir-615,dir-600
+
+2021.1.3周日
+security patch上的漏洞
+upload_certificate_int, upload_privatekey_int, upload_config_int, upload_ca_int
+测试其它其它几个upload_ 不存在该漏洞。均测试
+DAP-2310 2.07.RC031 
+DAP-2330 1.07.RC028
+DAP-2360 2.07.RC043
+DAP-2553 3.06.RC027
+DAP-2660 1.13.RC074 (HoT Fix)
+DAP-2690 3.16.RC100
+DAP-2695 1.17.RC063
+DAP-3320 1.01.RC014
+DAP-3662 1.01.RC022
+
+新漏洞 Content—Type:multipart/form-data; boundary=，且没有Content_Length: 才能触发 atoi(NULL) 位置，0x409070
+一直是Conent_Length，没注意
+KRACK Patch 全部测试均包含漏洞。
+DAP-2310 2.1ORC039 测试
+DAP-2330 1.10RC036 BETA 测试
+DAP-2360 2.10RC055 测试
+DAP-2553 3.10rc039 BETA 此型号最新 测试
+DAP-2660 1.15RC093 1.15rc131 1.15rc118 1.15rc131b 测试
+DAP-2690 3.20RC115 BETA 测试
+DAP-2695 1.20RC093 测试
+DAP-3320 1.05RC027 BETA 测试
+DAP-3662 krack patch 1.05rc069 beta 测试
+
+
+Karonte: Detecting Insecure Multi-binary Interactions in Embedded Firmware
+FirmAE：比firmadyne成功执行还要多么
+
+File sys calls
+
+https://profile.iiita.ac.in/bibhas.ghoshal/lab_files/System%20calls%20for%20files%20and%20directories%20in%20Linux.html
+
+TV-IP/TEW-APBO/TEW-AP(B)/TEW-DTR/TEW-DR(E)/TEW-DR(U)/TEW-GR(U)/TEW-BR(P)
+TEW-752DRU TEW-731BR TEW-652BRP TEW-673GRU router
+TEW-736RE  Easy-N-Range Extender tew-822DRE wifi range extender
+TEW-817DTR wireless travel router
+
+
+WAC/WAVN/WBRN/WGR/WNDR/WNR/WNAP/WN/WPN/MBRN/JNR/DG/DGN/LG/XWN/WNCE/EX
+XWN5001 access point
+WNCE4004 WiFi Adapter
+EX2700 wifi range extender
+JNR3300 router
+LG2200D router
+DGN1000Bv3 router
+MBRN3000 router
+WPN824v3 router
+
+ Vendor  & Product series & Device types & Nums\\
+ \hline
+ D-Link & \tabincell{c}{DIR~/~DI~/~DAP~/~DCH~/~ DSL~/~DSP~/~DWR~/~GO-RT} & \tabincell{c}{Wi-Fi Range Extender / Router  / Smart plug / Home hub} &  53 \\
+ \hline
+TP-Link &  TL-WDR~/~TL-WR~/~TL-WA &  Wi-Fi Range Extender / Router & 10\\
+\hline
+Trendnet & TEW-DRU~/~TEW-DTR~/~TV-IP~/~TEW-AP~/~TEW-DRE~ & Router/Travel Router/Camera/Access Point/Range extender & 34\\
+\hline 
+Netgear & WNDR~/~MBRN~/~JNR~/~DG~/~LG~/~XWN~/~WNCE~/~EX~/~XAVN & Router/Access point/Wi-Fi Adapter/Extender & 42 \\
+\hline
+
+
+20210112 周二，
+1)继续分析systrace_generate.py结果
+-------------------------solved---------------------------
+5016 SO_SNDBUF 173 181 failed loop on 168 ok
+4499 SO_SNDBUF 173 181 failed loop on 168 ok
+108298, 108299 108836 keywords, malformed name ok
+20880 nvram set init = 1 ok
+12933 mini_httpd segment fault 后续分析是否有漏洞
+-------------------------------future---------------------
+105632 Thread creation initialization
+13625 Initialize AP MIB failed!
+13075 120 199
+19465 120 199
+106049 120 199
+16029 120 199 invalid option -- 'E' No sockets bound same as 106012
+108945 109004 109016 ptread_create()
+106012 afl-fuzz.c change_argv循环中没有check argv[old_index]!=NULL No sockets bound,
+105943 not sockets bound
+105968 No sockets bound
+-------------------------------------------------------------
+
+
+20671 httpd没有启动，但http服务已经有了 dsl
+19352 httpd没有启动，但http服务已经有了 dsl
+18224 httpd没有启动， 数据库port字段不全。 dir-816
+20325 与上面类似，closed
+13221 无数据
+
+106302 qemu: uncaught target signal 11
+20803 qemu: uncaught target signal 6 (Aborted)
+4954 qemu: uncaught target signal 11 (Segmentation fault)
+14281 not exist
+
+106913 hang
+106030 odd syntax
+
+2)修改FirmAFL_2020, cpu_exec.c, cpus.c 添加recv前后syscall trace 
+编写generate_run_full.py run_afl_full.py systrace_generate_full.py systrace_clean.py
+9136测试 发现no instrumentation,分析了很久，原来feed_input直接返回了。
+feed_input 不加 printf("recv_buf:%s\n", recv_buf); 就出错,return 2，加了就正确很奇怪？？？？？？
+
+3)运行systrace_generate_full.py，一晚上跑完
+
+
+20210113 周三，
+一、根据TraceSim，使用Levenshtein来度量systrace, 编写calsimlarity.py(python3，用ratio比例模式）
+1）syscall int的list，使用chr编码成字符，然后转为字串即可度量
+2）在输出的syscall trace中，存在;开头而不是syscall num开头的行，分析cpu-exec.c未果，可能是多进程的原因造成输出两次。只要该行数据少于6个，则不处理
+3)分析108076(after sim=1)， 106030(before太大）
+4)comment out handle_accept_after中的into_syscall=0；这样168也可以print出来了。
+levenshtein ratio的说明
+https://www.kite.com/python/docs/Levenshtein.ratio
+
+二、USER_FUZZ 5016 一直loop 168的分析，
+问题处在0x40c198跳转错误问题，max_connection（1xE)与fd的比较，看来我们设置的socket_fd过大。将ori_network_socket = 0x10即可 4499通过了
+然后hang在40dfb8 GetSysUpTime，也没进入库函数，很奇怪！！！！！！1有可能是之前ipc失败造成的。
+
+三、20880  0x40a53 chang住了，分析后发现nvram_get操作不一样。直接看firmadyne源码，发现是因为没有nvram_init,导致init=0,进而访问/proc/mounts。
+init全局变量放在0x15bd0处，因此需要找到nvram加载在内存中的地址
+查找半天获取内存的函数（如loader_exec)，意识到libnvram.so内存部署与qemu无关，是目标程序调用库函数加载，而其需要调用系统调用target_mmap，因此监视该函数，发现加载。
+1）syscall.c,在TARGET_NR_mmap处获得基地址nvram_addr
+2）main.c,获取参数中是否有LD_PRELOAD=/firmadyne/libnvram.so（非环境变量），有则设置nvram_flag=1
+3）cpu-exec.c,afl_entry_point处，写入init的值。 mipseb,mipsel偏移值都是0x15bd0
+
+20210114 周四，
+继续解决systrace_generate失败的案例
+1）108298, 108299 108836 malformd keywords是因为生成比较慢，而之前可能kill掉了导致没write完。重新生成即成功。
+2）run_afl_full.py中需要将proinfo.ini 复制。 target_pgd是accept之后才确定的。
+3）105943(0x4026f8 after getopt)，106012，105968 监控full发现uhttpd参数应该是-f -h，与生成的不同。后来发现监控的是etc/init.d/uhttpd（ POSIX shell script, ASCII text executable），而非/usr/sbin/uhttpd。因此在linux_vmi_new.cpp中加入非init.d的限制。
+run_afl.py 中arg_encode(";", "\;")
+main.c 添加 fcntl F_GETFD return 0  105943 还需要 /etc/httpd.conf， 重新prepare
+httpd.conf仍然没有成功生成 导致segment error！！！！！！！！
+如何在FILE_ANALYSIS，在linux_vmi_new.cpp中，加上对process_name（无路经）的限制。
+
+4)4671 full error test too long?
+5)分析106302 segment fault，汇编有点看不明白直接找GPL源码。 progs.gpl/mathopd/core.c 
+run_servers sub_40AC54
+accept_connection sub_408F5C
+
+
