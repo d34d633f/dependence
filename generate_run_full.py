@@ -8,7 +8,17 @@ def generate_run_full(image_id, arch):
 	file_dst = open(script_dst, "w+")
 	remove_flag = 0
 	device_flag = 0
+	mount_flag = 0
 	for line in file_src.readlines():
+		if "DEVICE=" in line:
+			mount_flag = 1
+			continue
+		elif "del_partition" in line:
+			mount_flag = 0
+			continue
+		if mount_flag == 1:
+			continue
+
 		if remove_flag == 1:
 			remove_flag = 0
 		if device_flag == 1:
